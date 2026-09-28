@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""Boot a Claude-only agent fleet in cmux: Fable manager + 4 Opus workers.
+"""Boot an agent fleet in cmux: Claude Code manager + 4 Opus workers.
 
 Boots all five panes at once from claude-fleet.layout.json (manager on the left
 half, worker-1..4 in a 2x2 on the right), colors and labels the workspace, and
 writes <target>/.team/<fleet>.spawn.json so the fleet can be re-found later.
+
+The manager is always Claude Code. The workers run Claude Code by default, or
+Cursor Agent (pinned to Claude Opus) with --cwa. Everything worker-CLI-specific
+lives in fleet_runtime.py; this script resolves the runtime once and injects it.
 
 Unlike a 3-tier design, the manager IS a pane -- there is no outside orchestrator
 to exec into. This script boots the fleet and exits; you then talk to the manager
@@ -11,6 +15,7 @@ pane directly.
 
 Usage:
     ./spawn_claude_fleet.py <fleet-slug> [--cwd DIR] [--env-file PATH]
+    ./spawn_claude_fleet.py <fleet-slug> --cwa [--cursor-model ID]   # Cursor workers
     ./spawn_claude_fleet.py <fleet-slug> --close
 
 Requires python3 >= 3.11 and nothing else -- no third-party packages.
@@ -30,27 +35,35 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import NoReturn
+
+from fleet_runtime import (
+    INSTRUCTIONS_FILE,
+    WORKER_ROLES,
+    FleetContext,
+    RuntimeUnavailable,
+    WorkerRuntime,
+    make_runtime,
+    record_boot,
+    worker_config,
+)
 
 # Assets live beside this script, wherever it is installed. Deriving the path from
 # __file__ (rather than assuming ~/.claude/cmux) keeps the whole thing relocatable.
 ASSETS = Path(__file__).resolve().parent
 LAYOUT_FILE = ASSETS / "claude-fleet.layout.json"
 
-ROLES = ["manager", "worker-1", "worker-2", "worker-3", "worker-4"]
-MODELS = {
-    "manager": "fable",
-    "worker-1": "opus",
-    "worker-2": "opus",
-    "worker-3": "opus",
-    "worker-4": "opus",
-}
+ROLES = ["manager", *WORKER_ROLES]
+MANAGER_MODEL = "fable"  # the manager is ALWAYS Claude Code; --cwa never touches it
+WORKER_COMMAND = "__WORKER_COMMAND__"  # layout placeholder, filled by the worker runtime
+LAUNCH_DIR = "launch"  # under the bus: one script per pane, holding its full command
 UUID_RE = re.compile(r"[0-9a-fA-F-]{36}")
 
 # .team/ is runtime state; make it self-ignoring in whatever repo it lands in.
 TEAM_GITIGNORE = "*\n!.gitignore\n"
 
 
-def die(msg: str) -> None:
+def die(msg: str) -> NoReturn:
     print(msg, file=sys.stderr)
     sys.exit(1)
 
@@ -146,7 +159,7 @@ def dq_escape(s: str) -> str:
     return out
 
 
-def build_layout(fleet: str, target: Path) -> str:
+def build_layout(fleet: str, target: Path, worker_commands: dict[str, str]) -> str:
     """Interpolate the layout template and strip its _comment; return compact JSON.
 
     Substitution happens on the PARSED tree, not the raw text, and each
@@ -158,6 +171,10 @@ def build_layout(fleet: str, target: Path) -> str:
 
     Mixing these up is not cosmetic: the wrong escaping for the wrong context
     produces a pane command the shell cannot parse, and the agent never boots.
+
+    Worker surfaces carry __WORKER_COMMAND__; each is replaced AFTER the text
+    substitution with the complete, already-quoted command the worker runtime
+    built for that role (matched by the surface `name`, the layout's join key).
     """
     obj = json.loads(LAYOUT_FILE.read_text())
     obj.pop("_comment", None)
@@ -179,7 +196,57 @@ def build_layout(fleet: str, target: Path) -> str:
             return node
         return node
 
-    return json.dumps(walk(obj), separators=(",", ":"))
+    tree = walk(obj)
+
+    filled = set()
+
+    def inject(node):
+        if isinstance(node, dict):
+            if node.get("command") == WORKER_COMMAND:
+                name = node.get("name")
+                if name not in worker_commands:
+                    die(f"layout surface {name!r} wants a worker command, but no runtime command exists for it")
+                node["command"] = worker_commands[name]
+                filled.add(name)
+            for v in node.values():
+                inject(v)
+        elif isinstance(node, list):
+            for v in node:
+                inject(v)
+
+    inject(tree)
+    missing = set(worker_commands) - filled
+    if missing:
+        die(f"layout has no {WORKER_COMMAND} surface for: {', '.join(sorted(missing))}")
+    return json.dumps(tree, separators=(",", ":"))
+
+
+def stage_launch_scripts(layout: str, bus: Path) -> str:
+    """Move every pane command into <bus>/launch/<name>.sh; the pane runs `sh <script>`.
+
+    cmux types each pane command into the new shell before its line editor is
+    up. In that canonical tty mode macOS keeps at most MAX_CANON (1024) bytes
+    of a line and silently drops the rest -- Enter included -- so a longer
+    command sits truncated at the prompt and the agent never boots. The boot
+    prompts alone approach that limit, so no pane command is typed inline.
+    `exec` makes the agent replace the wrapper shell, so interrupts reach the
+    agent directly and quitting it returns to the pane's own shell as before.
+    """
+    launch_dir = bus / LAUNCH_DIR
+    launch_dir.mkdir(parents=True, exist_ok=True)
+
+    def stage(node):
+        if isinstance(node, dict):
+            if "command" in node and "name" in node:
+                script = launch_dir / f"{node['name']}.sh"
+                script.write_text(f"#!/bin/sh\nexec {node['command']}\n")
+                node = {**node, "command": f"sh {shlex.quote(str(script))}"}
+            return {k: stage(v) for k, v in node.items()}
+        if isinstance(node, list):
+            return [stage(v) for v in node]
+        return node
+
+    return json.dumps(stage(json.loads(layout)), separators=(",", ":"))
 
 
 def find_or_create_window() -> tuple[str, bool, str | None]:
@@ -239,19 +306,26 @@ def prepare_team_dir(fleet: str, target: Path) -> Path:
     # A stale flag from a previous run would read as an instant completion.
     for role in ROLES:
         (bus / f"{role}.done").unlink(missing_ok=True)
-    (bus / "requests.md").write_text("")
+    # Everything else on the bus -- worker notes, backlog, manager notes and any
+    # request nobody routed yet -- is fleet context and survives a restart,
+    # including a restart onto the other worker runtime.
+    (bus / "requests.md").touch()
 
     # The manager dispatches ONLY through this helper (send -> settle -> enter
     # -> verify -> recover). It lives on the bus because the bus path is the
     # one thing the manager can always re-derive, even after a resume.
     shutil.copy(ASSETS / "fleet_dispatch.py", bus / "dispatch.py")
     (bus / "dispatch.py").chmod(0o755)
+    # The worker protocol, inside the workspace, for runtimes that read it from
+    # disk instead of loading it as a system prompt. Same text for every runtime.
+    shutil.copy(ASSETS / "fleet-worker.md", bus / INSTRUCTIONS_FILE)
     return bus
 
 
-def write_spawn_file(fleet: str, win: str, target: Path) -> Path:
+def write_spawn_file(fleet: str, win: str, target: Path, runtime: WorkerRuntime) -> Path:
     """Record the STABLE handle (window UUID) + workspace name. Never surface refs."""
     spawn = target / ".team" / f"{fleet}.spawn.json"
+    worker_model = runtime.require_selection().cli_model
     spawn.write_text(
         json.dumps(
             {
@@ -261,7 +335,9 @@ def write_spawn_file(fleet: str, win: str, target: Path) -> Path:
                 "cwd": str(target),
                 "bus": str(target / ".team" / fleet),
                 "roles": ROLES,
-                "models": MODELS,
+                "models": {"manager": MANAGER_MODEL, **{r: worker_model for r in WORKER_ROLES}},
+                "manager_runtime": "claude",
+                "worker_runtime": runtime.name,
                 "layout": str(LAYOUT_FILE),
             },
             indent=2,
@@ -299,8 +375,11 @@ def close_fleet(fleet: str, target: Path) -> None:
     print(f"closed fleet '{fleet}' (workspace {ws})")
 
 
-def boot_fleet(fleet: str, target: Path, env_file: Path | None) -> None:
-    layout = build_layout(fleet, target)
+def boot_fleet(fleet: str, target: Path, env_file: Path | None,
+               runtime: WorkerRuntime, ctx: FleetContext) -> None:
+    sessions = {role: runtime.new_session(role, ctx) for role in WORKER_ROLES}
+    commands = {role: runtime.launch(role, ctx, sessions[role]) for role in WORKER_ROLES}
+    layout = stage_launch_scripts(build_layout(fleet, target, commands), ctx.bus)
     win, created_win, default_ws = find_or_create_window()
 
     create_args = [
@@ -337,21 +416,28 @@ def boot_fleet(fleet: str, target: Path, env_file: Path | None) -> None:
     cmux("set-status", "fleet", fleet, "--workspace", ws,
          "--color", "#3B82F6", "--icon", "bolt.fill")
 
-    spawn = write_spawn_file(fleet, win, target)
+    spawn = write_spawn_file(fleet, win, target, runtime)
+    record_boot(runtime, ctx, sessions)  # only once the panes actually exist
 
     print(f"fleet '{fleet}' up  window={win}  workspace={ws}  manager={manager}")
     print(f"  target : {target}")
     print(f"  bus    : {target / '.team' / fleet}")
     print(f"  spawn  : {spawn}")
-    print(f"  models : manager={MODELS['manager']}  workers={MODELS['worker-1']} x4")
+    print()
+    print(f"Manager: Claude Code (model: {MANAGER_MODEL})")
+    for line in runtime.summary_lines():
+        print(line)
+    for warning in runtime.warnings:
+        print(f"  warning: {warning}")
     print()
     print("Give the manager pane a job. Close with:")
     print(f"  {Path(__file__).name} {fleet} --close --cwd {shlex.quote(str(target))}")
 
 
-def main() -> None:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Boot a Claude-only fleet in cmux: Fable manager + 4 Opus workers."
+        description="Boot an agent fleet in cmux: Claude Code manager + 4 Opus workers "
+                    "(Claude Code workers by default, Cursor Agent workers with --cwa)."
     )
     parser.add_argument("fleet", help="fleet slug (dash-case); names the workspace")
     parser.add_argument("--cwd", default=os.getcwd(),
@@ -360,7 +446,22 @@ def main() -> None:
                         help="KEY=VALUE file injected into every pane")
     parser.add_argument("--close", action="store_true",
                         help="close this fleet's workspace instead of booting it")
-    args = parser.parse_args()
+    parser.add_argument("--cwa", action="store_true",
+                        help="Cursor Worker Agents: run the 4 workers in Cursor Agent on Claude Opus "
+                             "(the manager stays Claude Code)")
+    parser.add_argument("--cursor-model", default=None, metavar="ID",
+                        help="with --cwa: exact Cursor model id to use instead of the auto-selected "
+                             "newest Claude Opus (must be a Claude model the account lists)")
+    args = parser.parse_args(argv)
+    if args.cursor_model and not args.cwa:
+        parser.error("--cursor-model only applies to Cursor workers (--cwa)")
+    args.worker_config = worker_config(args.cwa, args.cursor_model)
+    args.runtime = args.worker_config.runtime
+    return args
+
+
+def main() -> None:
+    args = parse_args()
 
     fleet = slugify(args.fleet)
     if not fleet:
@@ -386,8 +487,18 @@ def main() -> None:
         close_fleet(fleet, target)
         return
 
+    # Resolve the worker runtime ONCE; from here on nothing branches on --cwa.
+    runtime = make_runtime(args.worker_config)
+    if not shutil.which("claude"):
+        die("`claude` is not on PATH -- the manager always runs in Claude Code.")
+    ctx = FleetContext(fleet=fleet, target=target, bus=target / ".team" / fleet, assets=ASSETS)
+    try:
+        runtime.preflight(ctx)  # before touching the bus: a refused runtime leaves no state
+    except RuntimeUnavailable as exc:
+        die(f"cannot start {runtime.label} workers:\n  {exc}")
+
     prepare_team_dir(fleet, target)
-    boot_fleet(fleet, target, env_file)
+    boot_fleet(fleet, target, env_file, runtime, ctx)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+"""Fake cmux for tests.
+
+Logs every call (argv as JSON, one per line) to $FAKE_CMUX_LOG. Understands the
+subset the spawner and dispatcher use:
+
+  identify --json                      -> {}
+  --id-format uuids list-windows --json -> one window with a UUID
+  workspace create ... --layout JSON   -> saves the layout to $FAKE_CMUX_LAYOUT
+  workspace list --window W --json     -> the created fleet workspace, if any
+  send-key ... enter                   -> if $FAKE_DONE_ON_ENTER names <bus>/<role>.done,
+                                          write <role>.md then <role>.done (a worker
+                                          that finishes instantly)
+  read-screen --surface S              -> contents of $FAKE_SCREEN (file), if set
+  everything else                      -> exit 0
+"""
+import json
+import os
+import sys
+
+WINDOW = "5EF07914-0000-4000-8000-000000000001"
+args = sys.argv[1:]
+log = os.environ.get("FAKE_CMUX_LOG")
+if log:
+    with open(log, "a") as fh:
+        fh.write(json.dumps(args) + "\n")
+
+state = os.environ.get("FAKE_CMUX_STATE")  # file holding the created workspace name
+
+if args[:1] == ["identify"]:
+    print("{}")
+elif "list-windows" in args:
+    print(json.dumps([{"id": WINDOW, "key": True}]))
+elif args[:2] == ["workspace", "create"]:
+    layout = args[args.index("--layout") + 1]
+    name = args[args.index("--name") + 1]
+    if os.environ.get("FAKE_CMUX_LAYOUT"):
+        with open(os.environ["FAKE_CMUX_LAYOUT"], "w") as fh:
+            fh.write(layout)
+    if state:
+        with open(state, "w") as fh:
+            fh.write(name)
+    print(json.dumps({"workspace_ref": "workspace:7", "surface_ref": "surface:1"}))
+elif args[:2] == ["workspace", "list"]:
+    name = open(state).read() if state and os.path.exists(state) else None
+    ws = [{"ref": "workspace:7", "custom_title": name}] if name else []
+    print(json.dumps({"workspaces": ws}))
+elif args[:1] == ["close-workspace"]:
+    if state and os.path.exists(state):
+        os.remove(state)
+elif args[:1] == ["send-key"] and args[-1] == "enter" and os.environ.get("FAKE_DONE_ON_ENTER"):
+    # simulate a worker that finishes instantly and follows the completion protocol
+    done = os.environ["FAKE_DONE_ON_ENTER"]
+    role = os.path.basename(done)[: -len(".done")]
+    with open(done[: -len(".done")] + ".md", "w") as fh:
+        fh.write(f"# {role} — fake task\n\nStatus: done\n")
+    with open(done, "w") as fh:
+        fh.write(f"{role} | fake task finished\n")
+elif args[:1] == ["read-screen"]:
+    screen = os.environ.get("FAKE_SCREEN")
+    if screen and os.path.exists(screen):
+        print(open(screen).read())
+sys.exit(0)

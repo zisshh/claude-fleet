@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+"""Fake Cursor CLI for tests.
+
+Mirrors the real surface checked against cursor-agent 2026.09.26:
+`--help`, `--list-models` (flat variant ids such as claude-opus-5-thinking-max),
+and a pane launch that REJECTS any --model value not in that list -- including
+bracketed forms like 'claude-opus-4-8[effort=max]' -- with
+"Cannot use this model: ...", exactly like the real CLI. An accepted launch
+dumps argv + CURSOR_CONFIG_DIR to $FAKE_DUMP_DIR and exits.
+
+FAKE_CURSOR_MODE:
+  ok          several Opus variants (thinking/non-thinking, levels, fast) plus distractors
+  noauth      --list-models fails with "Authentication required"
+  no_opus     only non-Opus models
+"""
+import json
+import os
+import sys
+
+MODE = os.environ.get("FAKE_CURSOR_MODE", "ok")
+
+
+def models():
+    if MODE == "no_opus":
+        return [("gpt-5.5-high", "GPT-5.5 High"),
+                ("claude-sonnet-4-6-thinking-max", "Claude Sonnet 4.6 Thinking Max")]
+    return [
+        ("auto", "Auto"),
+        ("gpt-5.5-high", "GPT-5.5 High"),
+        ("composer-2.5", "Composer 2.5"),
+        ("claude-opus-4-5-thinking-max", "Claude Opus 4.5 Thinking Max"),
+        ("claude-opus-4-8-high", "Claude Opus 4.8 High"),
+        ("claude-opus-4-8-max", "Claude Opus 4.8 Max"),
+        ("claude-opus-4-8-thinking-low", "Claude Opus 4.8 Thinking Low"),
+        ("claude-opus-4-8-thinking-max", "Claude Opus 4.8 Thinking Max"),
+        ("claude-opus-4-8-thinking-max-fast", "Claude Opus 4.8 Thinking Max Fast"),
+        ("claude-sonnet-4-6-thinking-max", "Claude Sonnet 4.6 Thinking Max"),
+    ]
+
+
+def main():
+    args = sys.argv[1:]
+    if args == ["--help"]:
+        print("Usage: agent [options]\n\nStart the Cursor Agent")
+        return 0
+    if args == ["--list-models"]:
+        if MODE == "noauth":
+            print("Error: Authentication required. Run 'agent login'", file=sys.stderr)
+            return 1
+        print("Available models\n")
+        for mid, name in models():
+            print(f"\x1b[36m{mid}\x1b[0m - {name}")
+        print("\nTip: use --model <id>")
+        return 0
+    if "--model" in args:
+        wanted = args[args.index("--model") + 1]
+        ids = [mid for mid, _ in models()]
+        if wanted not in ids:
+            print(f"Cannot use this model: {wanted}. Available models: {', '.join(ids)}")
+            return 1
+    dump = os.environ.get("FAKE_DUMP_DIR")
+    if dump:
+        cfg = os.environ.get("CURSOR_CONFIG_DIR", "")
+        name = os.path.basename(cfg) if cfg else "cursor-unknown"
+        with open(os.path.join(dump, f"cursor-{name}.json"), "w") as fh:
+            json.dump({"argv": args, "CURSOR_CONFIG_DIR": cfg, "cwd": os.getcwd()}, fh)
+    return 0
+
+
+sys.exit(main())

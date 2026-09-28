@@ -1,0 +1,13 @@
+#!/usr/bin/env python3
+"""Fake Claude Code CLI for tests: dump argv to $FAKE_DUMP_DIR and exit."""
+import json
+import os
+import sys
+
+dump = os.environ.get("FAKE_DUMP_DIR")
+if dump:
+    args = sys.argv[1:]
+    # the manager has no --session-id; workers each have a unique one
+    key = args[args.index("--session-id") + 1] if "--session-id" in args else "manager"
+    with open(os.path.join(dump, f"claude-{key}.json"), "w") as fh:
+        json.dump({"argv": args, "cwd": os.getcwd()}, fh)

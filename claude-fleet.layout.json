@@ -1,5 +1,5 @@
 {
-  "_comment": "Declarative cmux layout for a Claude-only fleet. Template — spawn_claude_fleet.py substitutes __FEATURE__ (fleet slug, dash-case, safe anywhere), __CWD__ (absolute target path, escaped for INSIDE the double-quoted boot prompts and wrapped in visible \\\" quotes there, so spaces and apostrophes survive) and __ASSETS__ (absolute path to the directory holding these files, shell-quoted as a bare word) before passing this to `cmux workspace create --layout`. CONTEXT RULE: __CWD__ may only appear inside the double-quoted boot prompts; __ASSETS__ only in bare argument positions. Swapping them produces a pane command the shell cannot parse. Manager (Fable) occupies the left half; worker-1..4 (Opus) fill a 2x2 on the right. Each pane's command auto-launches its Claude Code agent on creation, so the whole fleet boots at once — no per-pane driving. The `name` field is the join key: the manager maps names to live surface refs via `cmux tree --workspace <ws> --json`, so no roster file is ever needed. NOTE: list-pane-surfaces is NOT usable for this — it is pane-scoped (defaults to the focused pane), so it cannot enumerate sibling panes.",
+  "_comment": "Declarative cmux layout for the fleet (Claude Code manager + 4 workers). Template — spawn_claude_fleet.py substitutes __FEATURE__ (fleet slug, dash-case, safe anywhere), __CWD__ (absolute target path, escaped for INSIDE the double-quoted boot prompts and wrapped in visible \\\" quotes there, so spaces and apostrophes survive) and __ASSETS__ (absolute path to the directory holding these files, shell-quoted as a bare word) before passing this to `cmux workspace create --layout`. CONTEXT RULE: __CWD__ may only appear inside the double-quoted boot prompts; __ASSETS__ only in bare argument positions. Swapping them produces a pane command the shell cannot parse. Manager (Claude Code, Fable) occupies the left half; worker-1..4 fill a 2x2 on the right. The manager's command is literal and ALWAYS Claude Code. Worker surfaces carry __WORKER_COMMAND__, which spawn_claude_fleet.py replaces (after the placeholder substitution above, matched by `name`) with the complete, already shell-quoted command built by the selected worker runtime in fleet_runtime.py: Claude Code by default, Cursor Agent with --cwa. Same geometry either way. Each pane's command auto-launches its agent on creation, so the whole fleet boots at once — no per-pane driving. The `name` field is the join key: the manager maps names to live surface refs via `cmux tree --workspace <ws> --json`, so no roster file is ever needed. NOTE: list-pane-surfaces is NOT usable for this — it is pane-scoped (defaults to the focused pane), so it cannot enumerate sibling panes.",
   "direction": "horizontal",
   "split": 0.5,
   "children": [
@@ -28,7 +28,7 @@
                   {
                     "type": "terminal",
                     "name": "worker-1",
-                    "command": "claude --model opus --effort max --dangerously-skip-permissions --append-system-prompt-file __ASSETS__/fleet-worker.md \"You are worker-1 on fleet __FEATURE__. Your shared bus is the directory .team/__FEATURE__/ under \\\"__CWD__\\\"; your files there are worker-1.md and worker-1.done. Reply with one line: ready: worker-1  then wait for the manager to assign work.\""
+                    "command": "__WORKER_COMMAND__"
                   }
                 ]
               }
@@ -39,7 +39,7 @@
                   {
                     "type": "terminal",
                     "name": "worker-2",
-                    "command": "claude --model opus --effort max --dangerously-skip-permissions --append-system-prompt-file __ASSETS__/fleet-worker.md \"You are worker-2 on fleet __FEATURE__. Your shared bus is the directory .team/__FEATURE__/ under \\\"__CWD__\\\"; your files there are worker-2.md and worker-2.done. Reply with one line: ready: worker-2  then wait for the manager to assign work.\""
+                    "command": "__WORKER_COMMAND__"
                   }
                 ]
               }
@@ -56,7 +56,7 @@
                   {
                     "type": "terminal",
                     "name": "worker-3",
-                    "command": "claude --model opus --effort max --dangerously-skip-permissions --append-system-prompt-file __ASSETS__/fleet-worker.md \"You are worker-3 on fleet __FEATURE__. Your shared bus is the directory .team/__FEATURE__/ under \\\"__CWD__\\\"; your files there are worker-3.md and worker-3.done. Reply with one line: ready: worker-3  then wait for the manager to assign work.\""
+                    "command": "__WORKER_COMMAND__"
                   }
                 ]
               }
@@ -67,7 +67,7 @@
                   {
                     "type": "terminal",
                     "name": "worker-4",
-                    "command": "claude --model opus --effort max --dangerously-skip-permissions --append-system-prompt-file __ASSETS__/fleet-worker.md \"You are worker-4 on fleet __FEATURE__. Your shared bus is the directory .team/__FEATURE__/ under \\\"__CWD__\\\"; your files there are worker-4.md and worker-4.done. Reply with one line: ready: worker-4  then wait for the manager to assign work.\""
+                    "command": "__WORKER_COMMAND__"
                   }
                 ]
               }

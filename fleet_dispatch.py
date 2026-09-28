@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Deliver one task to one fleet worker, and VERIFY it actually submitted.
 
-Why this exists: `cmux send` types the task as one rapid burst, which the
-Claude Code TUI treats like a paste. If the follow-up `send-key enter` lands
+Why this exists: `cmux send` types the task as one rapid burst, which a
+worker TUI (Claude Code or Cursor Agent) treats like a paste. If the follow-up `send-key enter` lands
 inside that paste-coalescing window, the Enter is absorbed as a newline and
 the whole task sits parked in the input bar while the manager waits on a
 worker that was never asked. This script owns the full ritual:
@@ -21,13 +21,20 @@ Recovery-ladder safety, in order of what each rung risks:
 
 Verification signals, checked in this order each round:
   1. done-file exists (worker already finished a very fast task) -> delivered
-  2. "esc to interrupt" on screen (worker is actively working)    -> delivered
+  2. the worker TUI's "turn in progress" text on screen           -> delivered
+     (Claude Code: "esc to interrupt"; Cursor Agent: "ctrl+c to stop",
+     "Thinking…", "Responding…" -- read from <bus>/runtime.json)
   3. task fragment visible in the input-bar region (bottom lines) -> parked
   4. none of the above -> assume delivered (one harmless Enter fired first)
+
+Which TUI the workers run is recorded by the spawner in runtime.json beside
+this script on the bus. The manager never needs to know; this script adapts.
+A bus without runtime.json (older fleets) is treated as Claude Code.
 
 Usage:
     fleet_dispatch.py --surface surface:5 --clear /path/bus/worker-1.done \
         "one single-line task ..."
+    fleet_dispatch.py --surface surface:5 --interrupt   # stop the current turn (one keypress)
 
 Exit codes: 0 delivered (or confidently assumed), 1 could not deliver,
 2 bad invocation.
@@ -36,14 +43,39 @@ Exit codes: 0 delivered (or confidently assumed), 1 could not deliver,
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-WORKING_SIGNAL = "esc to interrupt"
 BOX_CHARS = "│╭╮╰╯─┌┐└┘║╔╗╚╝>"
+
+# Claude Code defaults: what a bus without runtime.json (pre --cwa fleets) means.
+DEFAULT_PROFILE = {
+    "runtime": "claude",
+    "working_signals": ["esc to interrupt"],
+    "interrupt_key": "escape",
+    "clear_key": "ctrl+c",
+}
+
+
+def load_profile(bus: Path) -> dict:
+    """The worker runtime's TUI dialect, as recorded by the spawner."""
+    profile = dict(DEFAULT_PROFILE)
+    try:
+        data = json.loads((bus / "runtime.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return profile
+    for key in DEFAULT_PROFILE:
+        if data.get(key):
+            profile[key] = data[key]
+    profile["working_signals"] = [s.lower() for s in profile["working_signals"]]
+    return profile
+
+
+PROFILE = load_profile(Path(__file__).resolve().parent)
 
 
 def sh(*args: str) -> subprocess.CompletedProcess:
@@ -76,7 +108,8 @@ def looks_parked(surface: str, task: str) -> bool:
 
 
 def looks_working(surface: str) -> bool:
-    return WORKING_SIGNAL in normalize(screen_tail(surface, 14))
+    screen = normalize(screen_tail(surface, 14))
+    return any(signal in screen for signal in PROFILE["working_signals"])
 
 
 def delivered(args, why: str) -> None:
@@ -90,8 +123,20 @@ def main() -> None:
     ap.add_argument("--clear", default=None, help="done-flag path to clear before dispatch (strongly recommended)")
     ap.add_argument("--settle", type=float, default=0.8, help="seconds between text and Enter")
     ap.add_argument("--confirm-wait", type=float, default=1.5, help="seconds before each verification read")
-    ap.add_argument("task", help="the task, ONE line")
+    ap.add_argument("--interrupt", action="store_true",
+                    help="stop the worker's current turn with ONE press of its runtime's interrupt key")
+    ap.add_argument("task", nargs="?", default="", help="the task, ONE line")
     args = ap.parse_args()
+
+    if args.interrupt:
+        # Exactly one press. Both TUIs exit on a quick second ctrl+c, and a
+        # closed pane cannot be respawned.
+        r = sh("cmux", "send-key", "--surface", args.surface, PROFILE["interrupt_key"])
+        if r.returncode != 0:
+            print(f"cmux send-key failed: {(r.stderr or r.stdout).strip()}", file=sys.stderr)
+            sys.exit(1)
+        print(f"interrupted ({PROFILE['interrupt_key']})")
+        sys.exit(0)
 
     task = args.task.strip()
     if not task:
@@ -138,8 +183,8 @@ def main() -> None:
     if looks_working(args.surface) or (done and done.exists()):
         delivered(args, "late confirmation")
     if looks_parked(args.surface, task):
-        print("retype: clearing input bar (single ctrl+c) and resending once", file=sys.stderr)
-        sh("cmux", "send-key", "--surface", args.surface, "ctrl+c")
+        print(f"retype: clearing input bar (single {PROFILE['clear_key']}) and resending once", file=sys.stderr)
+        sh("cmux", "send-key", "--surface", args.surface, PROFILE["clear_key"])
         time.sleep(0.5)
         sh("cmux", "send", "--surface", args.surface, task)
         time.sleep(max(args.settle, 1.5))  # wider settle: the fast path already failed once
