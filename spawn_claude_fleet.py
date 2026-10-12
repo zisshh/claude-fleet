@@ -237,8 +237,10 @@ def prepare_team_dir(fleet: str, target: Path) -> Path:
     bus.mkdir(parents=True, exist_ok=True)
 
     # A stale flag from a previous run would read as an instant completion.
+    # A stale progress checkpoint would make a fresh worker "resume" a dead task.
     for role in ROLES:
         (bus / f"{role}.done").unlink(missing_ok=True)
+        (bus / f"{role}.progress.md").unlink(missing_ok=True)
     (bus / "requests.md").write_text("")
 
     # The manager dispatches ONLY through this helper (send -> settle -> enter

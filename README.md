@@ -129,6 +129,39 @@ Three things make a resumed manager viable by design:
 Workers catch up from their own `<bus>/<role>.md` notes after a restart — that
 file surviving process death is why the protocol writes it.
 
+## Context management: /clear, compaction, re-anchoring
+
+Files are the memory; sessions are disposable.
+
+- **Identity survives resets.** Each pane command starts with
+  `FLEET_ROLE=<role>`. That is process environment, so `/clear` and compaction
+  cannot erase it, unlike the boot prompt.
+- **The re-anchor hook.** `fleet_context_hook.py` is a SessionStart hook with
+  matcher `clear|compact`. When `FLEET_ROLE` is set, it finds the bus through
+  `.team/*.spawn.json` and prints the agent's state into the fresh context:
+  - workers get their role, bus, `<role>.progress.md` and `<role>.md`
+  - the manager gets its role, bus and `backlog.md`
+
+  Outside a fleet pane it prints nothing, so it is safe to register globally:
+
+  ```json
+  "SessionStart": [{ "matcher": "clear|compact", "hooks": [{ "type": "command",
+    "command": "python3 ~/.claude/cmux/fleet_context_hook.py", "timeout": 5 }] }]
+  ```
+- **Mid-task compaction is survivable.** Workers rewrite
+  `<role>.progress.md` (task, done so far, decisions, next step) after each
+  meaningful step and delete it on completion. A compacted worker resumes from
+  "Next step" instead of restarting the task.
+- **The manager clears workers only at task boundaries.** It clears after
+  `.done` lands and is verified, when the worker is near the threshold or the
+  next task is unrelated. It never clears mid-task. The next dispatch names the
+  files to read (`<role>.md` "State for next task", other workers' Contracts),
+  so dependent work costs a few thousand tokens of reading, not hundreds of
+  thousands of carried context.
+- **The manager's memory is `backlog.md`.** Its `## In flight` table is
+  rewritten on every dispatch and completion, and re-injected after the
+  manager's own compaction.
+
 ## Files
 
 | File | Role |
@@ -138,6 +171,7 @@ file surviving process death is why the protocol writes it.
 | `fleet-manager.md` | Manager system prompt — all cmux mechanics live here. |
 | `fleet-worker.md` | Shared worker system prompt — role-agnostic; role comes from the boot prompt. |
 | `fleet_dispatch.py` | Verified dispatch: send → settle → Enter → confirm on the worker's screen → recover. Copied onto each fleet's bus as `dispatch.py` at boot. |
+| `fleet_context_hook.py` | SessionStart (`clear\|compact`) hook: re-injects role, bus and state files after a context reset. No-op outside fleet panes. |
 
 These are system-prompt *files* passed via `--append-system-prompt-file`, not
 Claude Code subagents. Keep them out of `~/.claude/agents/` — filing them there
@@ -299,3 +333,5 @@ work. Open:
 **Watch the manager's context.** It carries the cmux mechanics, the roster, the bus
 paths, and every worker's returned state. The manager compacting mid-run — and
 losing its roster or its in-flight task table — is the most likely first failure.
+Mitigated by the `## In flight` table in `backlog.md` plus the re-anchor hook.
+The hook's output has been tested offline, but not yet on a live compaction.

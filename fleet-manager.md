@@ -120,9 +120,10 @@ If you ever lose the bus path — a long run's early context can get compacted a
 | File | Written by | Purpose |
 |---|---|---|
 | `$BUS/<role>.md` | each worker | Its notes, decisions, and any contract other workers need. **Workers read each other's freely.** |
+| `$BUS/<role>.progress.md` | each worker | In-flight checkpoint, rewritten during a task, deleted on completion. If it exists, that worker has unfinished work. |
 | `$BUS/<role>.done` | each worker | Completion flag. One line: `<role> \| <summary>`. You poll and clear these. |
 | `$BUS/requests.md` | any worker | Cross-worker requests. Append-only. **You drain and route these.** |
-| `$BUS/backlog.md` | you | The living task list for the current job. |
+| `$BUS/backlog.md` | you | The living task list for the current job, plus the `## In flight` table. It is your memory across compaction. |
 
 When a worker needs something from another worker, it appends a line to `<bus>/requests.md` rather than blocking. Check that file every time you poll.
 
@@ -140,13 +141,39 @@ Route each request as a normal one-line dispatch to the right worker. Workers ne
 
 Prefer reading a worker's `$BUS/<role>.md` over re-reading its whole screen when you just need its conclusion. It is cheaper and it is what the worker actually meant to say.
 
+## Context hygiene — files are the memory, sessions are disposable
+
+Every agent's context fills up. At the auto-compact threshold, Claude Code summarises the conversation and carries on with the same task. The summary is lossy, and an agent past ~150k tokens is already reasoning worse. The fleet does not rely on any agent's memory. It relies on the bus.
+
+**Your own memory is `$BUS/backlog.md`.** Keep an `## In flight` table in it and rewrite the table on every dispatch and every completion: one row per worker with role, task (one line), dispatched-at, and status. If you are compacted or cleared, a SessionStart hook re-injects backlog.md. Whatever is not in that file, you no longer know.
+
+**Resetting a worker (`/clear`) — only at a task boundary:**
+
+- **When:** after the worker's `.done` has landed and you have verified its `<role>.md`, and at least one of these holds:
+  - its screen shows the auto-compact warning (`Context left until auto-compact`)
+  - it has already been compacted once
+  - it has done ~3 substantial tasks since its last reset
+  - the next task is unrelated to what it has been doing
+
+  A clean context before a fresh task is cheap and makes the work better.
+- **Never mid-task.** `/clear` throws away everything the worker has not yet checkpointed. If a worker auto-compacts mid-task, leave it alone. It continues on its own and resumes from `<role>.progress.md`. Verify the result as usual when `.done` lands.
+- **How:** send the slash command raw. It is not a task, so it does not go through the helper:
+  ```bash
+  cmux send --surface "$S" "/clear"; sleep 1; cmux send-key --surface "$S" enter; sleep 2
+  cmux read-screen --surface "$S" --lines 15   # confirm the conversation reset
+  ```
+  A hook re-anchors the cleared worker automatically: role, bus, last notes. Then dispatch its next task through the helper as normal.
+- **Make the next task self-sufficient.** A cleared worker knows only its files. If the task builds on earlier work, name what to read: `Read $BUS/worker-2.md (State for next task) and the Contracts in $BUS/worker-1.md first.` That costs a few thousand tokens. It replaces hundreds of thousands of stale ones.
+
+Prefer `/clear` plus files over `/compact`. A compacted worker carries a summary you cannot inspect. A cleared worker carries exactly what its files say, and you can read those files.
+
 ## Your workflow
 
 1. **Restate the goal.** One sentence into `## Current job` in `$BUS/backlog.md`.
 2. **Decompose.** Break the job into tasks that each fit on one line. Prefer four independent tasks over one big one.
-3. **Dispatch.** Clear flags, send, enter. In parallel wherever there is no dependency.
+3. **Dispatch.** Clear flags, send, enter. In parallel wherever there is no dependency. Update the `## In flight` table.
 4. **Poll.** Wait on `.done` files. Drain `$BUS/requests.md` on every pass (rotate, never truncate).
-5. **Verify.** Read each `$BUS/<role>.md`. Check the worker actually ran its verification rather than asserting success. If a worker's claim is thin, route it back with the specific gap.
+5. **Verify.** Read each `$BUS/<role>.md`. Check the worker actually ran its verification rather than asserting success. If a worker's claim is thin, route it back with the specific gap. Update the `## In flight` table. Decide whether that worker needs a `/clear` before its next task (see Context hygiene).
 6. **Integrate and report.** Aggregate into a single answer for the human: what happened, what each worker found, where they disagree. Where two workers overlap, say so — agreement across independent workers is your strongest signal.
 
 ## Secrets
